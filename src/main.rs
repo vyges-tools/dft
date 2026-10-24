@@ -22,7 +22,9 @@ USAGE:
   vyges physical dft replace <design.odb> --liberty FILE... -o OUT.odb
                                                   replace each flop by its closest scan equivalent
   vyges physical dft run     <design.odb> <job> -o OUT.odb  scan-replace and stitch the chains
-  vyges physical dft report  <design.odb> <job>  the chains as planned or as built
+  vyges physical dft report  <design.odb> --liberty FILE... --sdc FILE [--max-length N]
+                           [--max-chains N] [--clock-mixing no_mix|clock_mix] [--verbose]
+                                                  the scan chains as planned
   vyges physical dft --describe
   vyges physical dft --help
   vyges physical dft --version
@@ -54,7 +56,8 @@ const DESCRIBE: &str = r#"{
   "summary": "Scan insertion and stitching, so a chip can be tested after fabrication.",
   "maturity": "discovered",
   "provenance_limitations": [
-    "`replace` is built; `run` and `report` refuse with exit 3.",
+    "`replace` and `report` are built; `run` refuses with exit 3.",
+    "`report` refuses a design with child blocks, and constraints whose clocks are not each on one port.",
     "`replace` refuses a library where two scan cells are equally close in drive to a flop, or where a pg_pin has no known pg_type."
   ],
   "invocation": { "args_template": ["replace"], "emits_json": false },
@@ -171,6 +174,111 @@ fn replace(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The libraries as read, in order.
+fn read_libraries(files: &[String]) -> Result<Vec<vyges_sta::liberty::Library>, ExitCode> {
+    let mut libs = Vec::new();
+    for f in files {
+        let read = std::fs::read_to_string(f)
+            .map_err(|e| e.to_string())
+            .and_then(|text| vyges_sta::liberty_parse::parse(&text))
+            .and_then(|g| vyges_sta::liberty::Library::read(&g));
+        match read {
+            Ok(lib) => libs.push(lib),
+            Err(e) => return Err(input_error(&format!("cannot read {f}: {e}"))),
+        }
+    }
+    Ok(libs)
+}
+
+fn refused(why: String) -> ExitCode {
+    vyges_events::emit(&vyges_events::Event::new("vyges-dft", vyges_events::Severity::Error, why).with_code("DFT-REFUSED"));
+    ExitCode::from(3)
+}
+
+/// `report_dft_plan`: collect the scan cells (the clock at each from the timer), architect the
+/// chains, print the plan. Log lines are the reference's: collection warnings, then the plan.
+fn report(args: &[String]) -> ExitCode {
+    use vyges_dft::architect::{ArchitectConfig, ClockMixing};
+    let (mut pos, mut liberty, mut sdc, mut verbose): (Vec<String>, Vec<String>, Option<String>, bool) = (Vec::new(), Vec::new(), None, false);
+    let mut config = ArchitectConfig::default();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let flag = a.as_str();
+        if matches!(flag, "--liberty" | "--sdc" | "--max-length" | "--max-chains" | "--clock-mixing") {
+            let Some(v) = it.next().cloned() else { return usage_error(&format!("{flag} needs a value")) };
+            match flag {
+                "--liberty" => liberty.push(v),
+                "--sdc" => sdc = Some(v),
+                "--clock-mixing" => {
+                    config.clock_mixing = match v.as_str() {
+                        "no_mix" => ClockMixing::NoMix,
+                        "clock_mix" => ClockMixing::ClockMix,
+                        _ => return usage_error(&format!("--clock-mixing is no_mix or clock_mix, not `{v}`")),
+                    }
+                }
+                _ => {
+                    let Ok(n) = v.parse::<u64>() else { return usage_error(&format!("{flag} needs a number, not `{v}`")) };
+                    if flag == "--max-length" {
+                        config.max_length = Some(n);
+                    } else {
+                        config.max_chains = Some(n);
+                    }
+                }
+            }
+            continue;
+        }
+        match flag {
+            "--verbose" => verbose = true,
+            "-q" | "--quiet" | "-v" => {}
+            f if f.starts_with('-') => return usage_error(&format!("unknown option `{f}`")),
+            f => pos.push(f.to_string()),
+        }
+    }
+    let ([design], Some(sdc)) = (<[String; 1]>::try_from(pos).unwrap_or_default(), sdc) else {
+        return usage_error("report needs a design database and --sdc FILE");
+    };
+    let libs = match read_libraries(&liberty) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+    let Some(scale) = libs.first().map(|l| l.time_scale) else { return usage_error("report needs --liberty") };
+    let constraints = match vyges_loom::sdc::Sdc::load(&sdc) {
+        Ok(s) => s,
+        Err(e) => return input_error(&format!("cannot read {sdc}: {e:?}")),
+    };
+    let timer_sdc = match vyges_dft::design::timer_clocks(&constraints, scale) {
+        Ok(s) => s,
+        Err(e) => return refused(e),
+    };
+    let db = match vyges_opendb::Db::open(&design) {
+        Ok(db) => db,
+        Err(e) => return input_error(&format!("cannot read {design}: {e}")),
+    };
+    if !db.block_get_children().is_empty() {
+        return refused(format!("{design}: child blocks are not modelled"));
+    }
+    let netlist = vyges_grt::timer::netlist(&db);
+    let clocks = match vyges_dft::design::pin_clocks(&libs, &netlist, &timer_sdc) {
+        Ok(c) => c,
+        Err(e) => return refused(format!("the timer: {e}")),
+    };
+    let lib = vyges_dft::replace::merge_libraries(libs).unwrap_or_default();
+    let d = vyges_dft::design::OdbCollect { db: &db, clocks };
+    let (cells, log) = match vyges_dft::collect::collect_scan_cells(&d, &lib) {
+        Ok(r) => r,
+        Err(e) => return refused(format!("{e:?}")),
+    };
+    for l in &log {
+        println!("{l}");
+    }
+    let chains = match vyges_dft::architect::scan_architect(&config, cells) {
+        Ok(c) => c,
+        Err(e) => return refused(format!("{e:?}")),
+    };
+    print!("{}", vyges_dft::architect::report_dft_plan(&config, &chains, verbose));
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -188,6 +296,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("replace") => replace(&args[1..]),
+        Some("report") => report(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => refuse(cmd),
         Some(other) => {
             eprintln!("vyges-dft: unknown command `{other}`\n\n{USAGE}");

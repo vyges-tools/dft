@@ -445,6 +445,8 @@ dependencies = [
  "serde_json",
  "vyges-drt",
  "vyges-events",
+ "vyges-grt",
+ "vyges-loom",
  "vyges-opendb",
  "vyges-sta",
 ]
@@ -454,6 +456,13 @@ name = "vyges-drt"
 version = "0.1.45"
 dependencies = [
  "rayon",
+]
+
+[[package]]
+name = "vyges-est"
+version = "0.1.45"
+dependencies = [
+ "vyges-opendb",
 ]
 
 [[package]]
@@ -471,9 +480,17 @@ version = "0.1.45"
 source = "git+https://github.com/vyges-tools/geom?branch=main#3d0c5d05f575cc88618ca33e9ae54fbccc9ec357"
 
 [[package]]
+name = "vyges-grt"
+version = "0.1.45"
+dependencies = [
+ "vyges-est",
+ "vyges-opendb",
+ "vyges-sta",
+]
+
+[[package]]
 name = "vyges-layout"
 version = "0.1.45"
-source = "git+https://github.com/vyges-tools/layout?branch=main#3726a18df01586db338be97816624e3ea3b0841d"
 dependencies = [
  "miniz_oxide",
  "vyges-geom",
@@ -482,7 +499,6 @@ dependencies = [
 [[package]]
 name = "vyges-loom"
 version = "0.1.45"
-source = "git+https://github.com/vyges-tools/loom.git?branch=main#7f38d84d4323fc610a6eac2454715b8d2ba8ce7b"
 
 [[package]]
 name = "vyges-opendb"
