@@ -15,6 +15,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use vyges_drt::polygon90::Rect;
+use vyges_drt::rtree::{DynRTree, Limits};
+
 /// The clock edge a cell captures on. ⚠️ The DISCRIMINANT is part of a cell's domain id (its four
 /// bytes are hashed), so these values are not free to change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -131,9 +134,10 @@ pub struct HashDomainLimits {
 pub enum ArchitectError {
     /// `max_chains` of 0 leaves nowhere to put a cell.
     NoChainsAllowed,
-    /// Placed cells are ordered by a nearest-neighbour walk that is not built yet; refused rather
-    /// than returned in an order the reference would not produce.
-    PlacedOrderingNotBuilt,
+    /// The placed-cell walk found only the current cell among the 10 nearest (DFT-0010). The
+    /// reference cannot reach it either: values are unique, so while another cell is in the tree
+    /// one of the 10 nearest is not the current one.
+    TooManyOverlappingCells,
 }
 
 /// The cells grouped by hash domain.
@@ -254,14 +258,51 @@ pub fn architect(
     Ok(())
 }
 
+/// The cells looked at for the next one in the walk.
+const MAX_CELLS_TO_SEARCH: usize = 10;
+
 /// Unplaced cells keep their order (the reference returns early unless EVERY cell is placed).
-/// Placed cells are ordered by a nearest-neighbour walk over an R-tree; until that is transcribed
-/// it is refused.
-fn optimize_scan_wirelength(cells: &mut [ScanCell]) -> Result<(), ArchitectError> {
+/// Placed cells are walked nearest to nearest:
+///
+/// - the start is the lower-leftmost — the lowest `x + y` of the origin (summed as 32-bit ints),
+///   the first on a tie;
+/// - the origins go into an R*-tree of 4 ([`Limits::rstar`]), bulk loaded in cell order;
+/// - each step takes the first of the 10 nearest the current cell that is not it — the tree's
+///   own order among equal distances, which decides most steps on placed rows — THEN removes the
+///   current cell from the tree.
+fn optimize_scan_wirelength(cells: &mut Vec<ScanCell>) -> Result<(), ArchitectError> {
     if cells.is_empty() || cells.iter().any(|c| c.origin.is_none()) {
         return Ok(());
     }
-    Err(ArchitectError::PlacedOrderingNotBuilt)
+    let origin = |c: &ScanCell| c.origin.expect("placed");
+    let (mut start, mut lowest) = (0usize, i64::MAX);
+    for (i, c) in cells.iter().enumerate() {
+        let (x, y) = origin(c);
+        let dist = i64::from(x.wrapping_add(y));
+        if dist < lowest {
+            start = i;
+            lowest = dist;
+        }
+    }
+    let values: Vec<(Rect, usize)> = cells.iter().enumerate().map(|(i, c)| {
+        let (x, y) = origin(c);
+        (Rect { xl: x, yl: y, xh: x, yh: y }, i)
+    }).collect();
+    let mut tree = DynRTree::with_limits(values, Limits::rstar(4));
+    let mut cursor = start;
+    let mut order = vec![cursor];
+    while order.len() < cells.len() {
+        let next = tree.nearest(origin(&cells[cursor]), MAX_CELLS_TO_SEARCH).find(|&i| i != cursor);
+        let Some(next) = next else {
+            return Err(ArchitectError::TooManyOverlappingCells);
+        };
+        tree.remove(cursor);
+        cursor = next;
+        order.push(cursor);
+    }
+    let mut slots: Vec<Option<ScanCell>> = std::mem::take(cells).into_iter().map(Some).collect();
+    *cells = order.into_iter().map(|i| slots[i].take().expect("visited once")).collect();
+    Ok(())
 }
 
 /// Every chain, sorted by name AS A STRING: `chain_10` comes before `chain_2`.
@@ -343,8 +384,15 @@ mod tests {
         assert_eq!(run(&[(1, 10)])[&1], lim(2, 5));
         assert_eq!(run(&[(1, 9)])[&1], lim(2, 5));
         assert_eq!(run(&[(1, 6)])[&1], lim(2, 3));
+        let two = run(&[(1, 10), (2, 10)]);
+        assert_eq!((two[&1], two[&2]), (lim(2, 5), lim(2, 5)));
+        let two = run(&[(1, 10), (2, 9)]);
+        assert_eq!((two[&1], two[&2]), (lim(2, 5), lim(2, 5)));
         let two = run(&[(1, 10), (2, 15)]);
         assert_eq!((two[&1], two[&2]), (lim(2, 5), lim(3, 5)));
+        // A maximum of one chain takes every bit.
+        let one = infer_chain_count_from_max_length(&[(1, 10)].into_iter().collect(), 5, Some(1)).unwrap();
+        assert_eq!(one[&1], lim(1, 10));
     }
 
     #[test]
@@ -462,10 +510,39 @@ Scan chain 'chain_3' has 5 cells (5 bits)
         assert_eq!(edges, [ClockEdge::Falling, ClockEdge::Falling, ClockEdge::Rising]);
     }
 
+    fn placed(origins: &[(i32, i32)]) -> Vec<ScanCell> {
+        origins.iter().enumerate().map(|(i, &o)| ScanCell { origin: Some(o), ..cell(&i.to_string(), "clk", ClockEdge::Rising) }).collect()
+    }
+
+    fn names(cells: &[ScanCell]) -> Vec<usize> {
+        cells.iter().map(|c| c.name.parse().unwrap()).collect()
+    }
+
+    // The walk from the lower-leftmost cell, each step to the first of the 10 nearest that is
+    // not the current cell, in the R*-tree's order among equal distances: a 4 x 3 grid of pitch
+    // 10 and two more cells on (10, 10). From (10, 0) the cells at (20, 0) and the three at
+    // (10, 10) are equally near; the tree's order takes cell 13 — the reference's walk.
     #[test]
-    fn placed_cells_are_refused_until_their_ordering_is_built() {
-        let mut c = cell("a", "clk", ClockEdge::Rising);
-        c.origin = Some((0, 0));
-        assert_eq!(scan_architect(&no_mix(10), vec![c]), Err(ArchitectError::PlacedOrderingNotBuilt));
+    fn placed_cells_walk_nearest_first_in_the_reference_order() {
+        let mut cells = placed(&[(0, 0), (10, 0), (20, 0), (30, 0), (0, 10), (10, 10), (20, 10), (30, 10), (0, 20), (10, 20), (20, 20), (30, 20), (10, 10), (10, 10)]);
+        optimize_scan_wirelength(&mut cells).unwrap();
+        assert_eq!(names(&cells), [0, 1, 13, 5, 12, 9, 8, 4, 6, 7, 3, 2, 10, 11]);
+    }
+
+    // The start is the lowest x + y, the FIRST on a tie: (5, 0) and (0, 5) tie; cell 1 starts.
+    #[test]
+    fn the_walk_starts_at_the_first_lowest_x_plus_y() {
+        let mut cells = placed(&[(50, 50), (5, 0), (0, 5)]);
+        optimize_scan_wirelength(&mut cells).unwrap();
+        assert_eq!(names(&cells), [1, 2, 0]);
+    }
+
+    // One unplaced cell and the reference returns before walking: the order stays as given.
+    #[test]
+    fn one_unplaced_cell_keeps_the_given_order() {
+        let mut cells = placed(&[(50, 50), (5, 0), (0, 5)]);
+        cells[2].origin = None;
+        optimize_scan_wirelength(&mut cells).unwrap();
+        assert_eq!(names(&cells), [0, 1, 2]);
     }
 }
