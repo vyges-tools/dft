@@ -21,7 +21,9 @@ vyges physical dft — scan insertion and stitching, so a chip can be tested aft
 USAGE:
   vyges physical dft replace <design.odb> --liberty FILE... -o OUT.odb
                                                   replace each flop by its closest scan equivalent
-  vyges physical dft run     <design.odb> <job> -o OUT.odb  scan-replace and stitch the chains
+  vyges physical dft run     <design.odb> --liberty FILE... --sdc FILE -o OUT.odb [--max-length N]
+                           [--max-chains N] [--clock-mixing no_mix|clock_mix] [--trace]
+                                                  stitch the planned chains and record them
   vyges physical dft report  <design.odb> --liberty FILE... --sdc FILE [--max-length N]
                            [--max-chains N] [--clock-mixing no_mix|clock_mix] [--verbose]
                                                   the scan chains as planned
@@ -56,8 +58,8 @@ const DESCRIBE: &str = r#"{
   "summary": "Scan insertion and stitching, so a chip can be tested after fabrication.",
   "maturity": "discovered",
   "provenance_limitations": [
-    "`replace` and `report` are built; `run` refuses with exit 3.",
-    "`report` refuses a design with child blocks, and constraints whose clocks are not each on one port.",
+    "`replace`, `report` and `run` are built; scan port name patterns are the defaults.",
+    "`report` and `run` refuse a design with child blocks, and constraints whose clocks are not each on one port.",
     "`replace` refuses a library where two scan cells are equally close in drive to a flop, or where a pg_pin has no known pg_type."
   ],
   "invocation": { "args_template": ["replace"], "emits_json": false },
@@ -195,29 +197,42 @@ fn refused(why: String) -> ExitCode {
     ExitCode::from(3)
 }
 
-/// `report_dft_plan`: collect the scan cells (the clock at each from the timer), architect the
-/// chains, print the plan. Log lines are the reference's: collection warnings, then the plan.
-fn report(args: &[String]) -> ExitCode {
+/// What `report` and `run` share: the options, the database, the libraries and the plan.
+struct Plan {
+    db: vyges_opendb::Db,
+    lib: vyges_sta::liberty::Library,
+    config: vyges_dft::architect::ArchitectConfig,
+    chains: Vec<vyges_dft::architect::ScanChain>,
+    verbose: bool,
+    trace: bool,
+    out: Option<String>,
+}
+
+/// `scanArchitect`: collect the scan cells (the clock at each from the timer), then architect the
+/// chains. Collection's warnings are printed as they are logged.
+fn plan(cmd: &str, args: &[String]) -> Result<Plan, ExitCode> {
     use vyges_dft::architect::{ArchitectConfig, ClockMixing};
-    let (mut pos, mut liberty, mut sdc, mut verbose): (Vec<String>, Vec<String>, Option<String>, bool) = (Vec::new(), Vec::new(), None, false);
+    let (mut pos, mut liberty, mut sdc, mut verbose, mut trace, mut out): (Vec<String>, Vec<String>, Option<String>, bool, bool, Option<String>) =
+        (Vec::new(), Vec::new(), None, false, false, None);
     let mut config = ArchitectConfig::default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let flag = a.as_str();
-        if matches!(flag, "--liberty" | "--sdc" | "--max-length" | "--max-chains" | "--clock-mixing") {
-            let Some(v) = it.next().cloned() else { return usage_error(&format!("{flag} needs a value")) };
+        if matches!(flag, "--liberty" | "--sdc" | "--max-length" | "--max-chains" | "--clock-mixing" | "-o") {
+            let Some(v) = it.next().cloned() else { return Err(usage_error(&format!("{flag} needs a value"))) };
             match flag {
                 "--liberty" => liberty.push(v),
                 "--sdc" => sdc = Some(v),
+                "-o" => out = Some(v),
                 "--clock-mixing" => {
                     config.clock_mixing = match v.as_str() {
                         "no_mix" => ClockMixing::NoMix,
                         "clock_mix" => ClockMixing::ClockMix,
-                        _ => return usage_error(&format!("--clock-mixing is no_mix or clock_mix, not `{v}`")),
+                        _ => return Err(usage_error(&format!("--clock-mixing is no_mix or clock_mix, not `{v}`"))),
                     }
                 }
                 _ => {
-                    let Ok(n) = v.parse::<u64>() else { return usage_error(&format!("{flag} needs a number, not `{v}`")) };
+                    let Ok(n) = v.parse::<u64>() else { return Err(usage_error(&format!("{flag} needs a number, not `{v}`"))) };
                     if flag == "--max-length" {
                         config.max_length = Some(n);
                     } else {
@@ -229,53 +244,81 @@ fn report(args: &[String]) -> ExitCode {
         }
         match flag {
             "--verbose" => verbose = true,
+            "--trace" => trace = true,
             "-q" | "--quiet" | "-v" => {}
-            f if f.starts_with('-') => return usage_error(&format!("unknown option `{f}`")),
+            f if f.starts_with('-') => return Err(usage_error(&format!("unknown option `{f}`"))),
             f => pos.push(f.to_string()),
         }
     }
     let ([design], Some(sdc)) = (<[String; 1]>::try_from(pos).unwrap_or_default(), sdc) else {
-        return usage_error("report needs a design database and --sdc FILE");
+        return Err(usage_error(&format!("{cmd} needs a design database and --sdc FILE")));
     };
-    let libs = match read_libraries(&liberty) {
-        Ok(l) => l,
-        Err(code) => return code,
-    };
-    let Some(scale) = libs.first().map(|l| l.time_scale) else { return usage_error("report needs --liberty") };
-    let constraints = match vyges_loom::sdc::Sdc::load(&sdc) {
-        Ok(s) => s,
-        Err(e) => return input_error(&format!("cannot read {sdc}: {e:?}")),
-    };
-    let timer_sdc = match vyges_dft::design::timer_clocks(&constraints, scale) {
-        Ok(s) => s,
-        Err(e) => return refused(e),
-    };
-    let db = match vyges_opendb::Db::open(&design) {
-        Ok(db) => db,
-        Err(e) => return input_error(&format!("cannot read {design}: {e}")),
-    };
+    let libs = read_libraries(&liberty)?;
+    let Some(scale) = libs.first().map(|l| l.time_scale) else { return Err(usage_error(&format!("{cmd} needs --liberty"))) };
+    let constraints = vyges_loom::sdc::Sdc::load(&sdc).map_err(|e| input_error(&format!("cannot read {sdc}: {e:?}")))?;
+    let timer_sdc = vyges_dft::design::timer_clocks(&constraints, scale).map_err(refused)?;
+    let db = vyges_opendb::Db::open(&design).map_err(|e| input_error(&format!("cannot read {design}: {e}")))?;
     if !db.block_get_children().is_empty() {
-        return refused(format!("{design}: child blocks are not modelled"));
+        return Err(refused(format!("{design}: child blocks are not modelled")));
     }
     let netlist = vyges_grt::timer::netlist(&db);
-    let clocks = match vyges_dft::design::pin_clocks(&libs, &netlist, &timer_sdc) {
-        Ok(c) => c,
-        Err(e) => return refused(format!("the timer: {e}")),
-    };
+    let clocks = vyges_dft::design::pin_clocks(&libs, &netlist, &timer_sdc).map_err(|e| refused(format!("the timer: {e}")))?;
     let lib = vyges_dft::replace::merge_libraries(libs).unwrap_or_default();
     let d = vyges_dft::design::OdbCollect { db: &db, clocks };
-    let (cells, log) = match vyges_dft::collect::collect_scan_cells(&d, &lib) {
-        Ok(r) => r,
-        Err(e) => return refused(format!("{e:?}")),
-    };
+    let (cells, log) = vyges_dft::collect::collect_scan_cells(&d, &lib).map_err(|e| refused(format!("{e:?}")))?;
     for l in &log {
         println!("{l}");
     }
-    let chains = match vyges_dft::architect::scan_architect(&config, cells) {
-        Ok(c) => c,
-        Err(e) => return refused(format!("{e:?}")),
+    let chains = vyges_dft::architect::scan_architect(&config, cells).map_err(|e| refused(format!("{e:?}")))?;
+    Ok(Plan { db, lib, config, chains, verbose, trace, out })
+}
+
+/// `report_dft_plan`: the plan, printed. Log lines are the reference's.
+fn report(args: &[String]) -> ExitCode {
+    match plan("report", args) {
+        Ok(p) => {
+            print!("{}", vyges_dft::architect::report_dft_plan(&p.config, &p.chains, p.verbose));
+            ExitCode::SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
+/// `execute_dft_plan`: the plan stitched into the database, then the chains recorded in it.
+/// `--trace` prints the reference's `scan_cell_connect` debug lines.
+fn run(args: &[String]) -> ExitCode {
+    let mut p = match plan("run", args) {
+        Ok(p) => p,
+        Err(code) => return code,
     };
-    print!("{}", vyges_dft::architect::report_dft_plan(&config, &chains, verbose));
+    let Some(out) = p.out.clone() else { return usage_error("run needs -o OUT.odb") };
+    let masters: std::collections::HashMap<String, String> = p.chains.iter().flat_map(|c| &c.cells).map(|c| (c.name.clone(), p.db.inst_master(&c.name))).collect();
+    let mut trace = Vec::new();
+    let stitched = {
+        let mut d = vyges_dft::design::OdbStitch { db: &mut p.db };
+        vyges_dft::stitch::stitch(&mut d, &p.lib, &|i: &str| masters[i].clone(), &vyges_dft::stitch::StitchConfig::default(), &p.chains, &mut trace)
+    };
+    if p.trace {
+        for l in &trace {
+            println!("{l}");
+        }
+    }
+    let stitched = match stitched {
+        Ok(s) => s,
+        Err(vyges_dft::stitch::StitchError::Error(line)) => {
+            println!("{line}");
+            return ExitCode::from(1);
+        }
+        Err(vyges_dft::stitch::StitchError::Refused(why)) => return refused(why),
+    };
+    let records = vyges_dft::design::scan_chain_records(&p.chains, &stitched);
+    if let Err(e) = p.db.dft_write_scan_chains(&records) {
+        return input_error(&format!("cannot record the scan chains: {e}"));
+    }
+    if let Err(e) = p.db.write(&out) {
+        return input_error(&format!("cannot write {out}: {e}"));
+    }
+    eprintln!("vyges-dft: {} chain(s) stitched; wrote {out}", stitched.len());
     ExitCode::SUCCESS
 }
 
@@ -297,6 +340,7 @@ fn main() -> ExitCode {
         }
         Some("replace") => replace(&args[1..]),
         Some("report") => report(&args[1..]),
+        Some("run") => run(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => refuse(cmd),
         Some(other) => {
             eprintln!("vyges-dft: unknown command `{other}`\n\n{USAGE}");

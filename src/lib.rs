@@ -7,4 +7,5 @@
 pub mod replace;
 pub mod collect;
 pub mod architect;
+pub mod stitch;
 pub mod design;

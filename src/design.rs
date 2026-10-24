@@ -7,13 +7,15 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use vyges_opendb::Db;
+use vyges_opendb::{Db, DftScanChain, DftScanInst, DftTerm};
 use vyges_sta::graph::Graph;
 use vyges_sta::liberty::Library;
 use vyges_sta::sdc::{user_to_sta, Clock, Sdc};
 use vyges_sta::search::Search;
 
+use crate::architect::{ClockEdge, ScanChain};
 use crate::collect::CollectDesign;
+use crate::stitch::{StitchDesign, StitchedChain, Term};
 
 /// The constraints' clocks as the timer takes them, in the order they were made. Each must be on
 /// one port: a virtual clock, a clock on an instance pin, or one on several ports is refused.
@@ -83,4 +85,98 @@ impl CollectDesign for OdbCollect<'_> {
     fn clocks(&self, inst: &str, pin: &str) -> Vec<String> {
         self.clocks.get(&format!("{inst}/{pin}")).cloned().unwrap_or_default()
     }
+}
+
+/// The database's top block, as stitching edits it.
+pub struct OdbStitch<'a> {
+    pub db: &'a mut Db,
+}
+
+fn some(s: String) -> Option<String> {
+    (!s.is_empty()).then_some(s)
+}
+
+impl StitchDesign for OdbStitch<'_> {
+    fn inst_exists(&self, inst: &str) -> bool {
+        !self.db.inst_master(inst).is_empty()
+    }
+    fn iterm_exists(&self, inst: &str, mterm: &str) -> bool {
+        !self.db.iterm_get_io_type(inst, mterm).is_empty()
+    }
+    fn iterm_io_type(&self, inst: &str, mterm: &str) -> String {
+        self.db.iterm_get_io_type(inst, mterm)
+    }
+    fn bterm_exists(&self, port: &str) -> bool {
+        !self.db.bterm_get_io_type(port).is_empty()
+    }
+    fn bterm_io_type(&self, port: &str) -> String {
+        self.db.bterm_get_io_type(port)
+    }
+    fn net_of(&self, t: &Term) -> Option<String> {
+        match t {
+            Term::Port(p) => some(self.db.bterm_get_net(p)),
+            Term::Pin(i, m) => some(self.db.iterm_get_net(i, m)),
+        }
+    }
+    fn net_bterms(&self, net: &str) -> Vec<String> {
+        self.db.net_bterms(net)
+    }
+    fn net_create(&mut self, name: &str) -> Result<bool, String> {
+        self.db.net_try_create(name).map_err(|e| e.to_string())
+    }
+    fn net_set_sig_type(&mut self, net: &str, sig: &str) -> Result<(), String> {
+        self.db.net_set_sig_type(net, sig).map_err(|e| e.to_string())
+    }
+    fn bterm_create(&mut self, net: &str, name: &str) -> Result<bool, String> {
+        self.db.bterm_try_create(net, name).map_err(|e| e.to_string())
+    }
+    fn bterm_set_sig_type(&mut self, port: &str, sig: &str) -> Result<(), String> {
+        self.db.bterm_set_sig_type(port, sig).map_err(|e| e.to_string())
+    }
+    fn bterm_set_io_type(&mut self, port: &str, io: &str) -> Result<(), String> {
+        self.db.bterm_set_io_type(port, io).map_err(|e| e.to_string())
+    }
+    fn connect(&mut self, t: &Term, net: &str) -> Result<(), String> {
+        match t {
+            Term::Port(p) => self.db.bterm_connect(p, net),
+            Term::Pin(i, m) => self.db.connect(i, m, net),
+        }
+        .map_err(|e| e.to_string())
+    }
+}
+
+fn odb_term(t: &Term) -> DftTerm {
+    match t {
+        Term::Port(p) => DftTerm::Port(p.clone()),
+        Term::Pin(i, m) => DftTerm::Pin(i.clone(), m.clone()),
+    }
+}
+
+/// The chains as `execute_dft_plan` records them: per cell its bits, enable, scan in and out, and
+/// clock domain; per chain its enable, in and out.
+pub fn scan_chain_records(chains: &[ScanChain], stitched: &[StitchedChain]) -> Vec<DftScanChain> {
+    chains
+        .iter()
+        .zip(stitched)
+        .map(|(c, s)| DftScanChain {
+            name: c.name.clone(),
+            cells: c
+                .cells
+                .iter()
+                .zip(&s.cells)
+                .map(|(cell, (enable, scan_in, scan_out))| DftScanInst {
+                    inst: cell.name.clone(),
+                    bits: cell.bits as u32,
+                    enable: odb_term(enable),
+                    scan_in: odb_term(scan_in),
+                    scan_out: odb_term(scan_out),
+                    clock: cell.domain.clock.clone(),
+                    falling: cell.domain.edge == ClockEdge::Falling,
+                })
+                .collect(),
+            enable: odb_term(&s.enable),
+            scan_in: odb_term(&s.scan_in),
+            scan_out: odb_term(&s.scan_out),
+        })
+        .collect()
 }
