@@ -65,7 +65,7 @@ const DESCRIBE: &str = r#"{
   "invocation": { "args_template": ["replace"], "emits_json": false },
   "inputs": { "type": "object", "properties": {} },
   "artifacts": [],
-  "assertion": { "id": "dft-ok", "field": "status", "pass_when": { "equals": "ok" } },
+  "assertion": { "id": "dft-ok", "field": "status", "pass_when": { "eq": "ok" } },
   "consumes": []
 }"#;
 
@@ -361,6 +361,8 @@ mod tests {
         // Anything else is read as `discovered` and every verdict becomes `unknown`.
         let m = d["maturity"].as_str().unwrap();
         assert!(["discovered", "structured", "workflow-validated"].contains(&m), "{m}");
+        // `eq` is the schema's predicate; `equals` is dropped at runtime and the verdict is unknown.
+        assert_eq!(d["assertion"]["pass_when"]["eq"], "ok");
     }
 
     #[test]
