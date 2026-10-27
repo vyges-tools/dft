@@ -322,7 +322,7 @@ fn run(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn main() -> ExitCode {
+pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None | Some("-h") | Some("--help") => {
