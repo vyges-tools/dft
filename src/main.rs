@@ -60,13 +60,38 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "`replace`, `report` and `run` are built; scan port name patterns are the defaults.",
     "`report` and `run` refuse a design with child blocks, and constraints whose clocks are not each on one port.",
-    "`replace` refuses a library where two scan cells are equally close in drive to a flop, or where a pg_pin has no known pg_type."
+    "`replace` refuses a library where two scan cells are equally close in drive to a flop, or where a pg_pin has no known pg_type.",
+    "The described call is `run`: the scan chains planned over the design's scan cells, stitched, recorded in the database and the database written to `out`. It stitches only flops that are already scan cells: run `replace` on the design first (the engine's own arguments), or every flop is skipped with a DFT-0007 warning and 0 chains are stitched, exit 0.",
+    "One Liberty is described; more libraries (a cell resolves to the first that has it) need the engine's own arguments.",
+    "`run` prints its log and writes the database; it has no --json output (a --json is refused as an unknown option, exit 2), so emits_json is false and the result is the printed log. The chain count is printed on stderr.",
+    "Scan stitching establishes no claim about the design: the assertion is not_applicable.",
+    "input_hash covers the argument vector, not the content of the database, Liberty or SDC it names."
   ],
-  "invocation": { "args_template": ["replace"], "emits_json": false },
-  "inputs": { "type": "object", "properties": {} },
-  "artifacts": [],
-  "assertion": { "id": "dft-ok", "field": "status", "pass_when": { "eq": "ok" } },
-  "consumes": []
+  "invocation": {
+    "args_template": ["run", "{design}", "--liberty", "{liberty}", "--sdc", "{sdc}", "-o", "{out}"],
+    "optional": [
+      { "arg": "max_length", "flag": "--max-length" },
+      { "arg": "max_chains", "flag": "--max-chains" },
+      { "arg": "clock_mixing", "flag": "--clock-mixing" }
+    ],
+    "emits_json": false
+  },
+  "inputs": {
+    "type": "object",
+    "required": ["design", "liberty", "sdc", "out"],
+    "properties": {
+      "design": { "type": "string", "description": "design database (.odb) whose flops have been scan-replaced" },
+      "liberty": { "type": "string", "description": "Liberty library (.lib) holding the design's cells" },
+      "sdc": { "type": "string", "description": "timing constraints (.sdc): the clocks that group the scan cells" },
+      "out": { "type": "string", "description": "database (.odb) to write, with the chains stitched and recorded" },
+      "max_length": { "type": "integer", "description": "the longest chain wanted, in bits (default 200)" },
+      "max_chains": { "type": "integer", "description": "at most this many chains per group; chains are lengthened rather than exceed it" },
+      "clock_mixing": { "type": "string", "enum": ["no_mix", "clock_mix"], "description": "whether a chain may mix clock domains (default no_mix)" }
+    }
+  },
+  "artifacts": [ { "role": "odb", "from_arg": "out" } ],
+  "assertion": { "id": "dft-stitched", "not_applicable": true },
+  "consumes": ["odb", "liberty", "sdc"]
 }"#;
 
 fn refuse(what: &str) -> ExitCode {
@@ -324,6 +349,11 @@ fn run(args: &[String]) -> ExitCode {
 
 pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    dispatch(&args)
+}
+
+/// The command named first, run on the rest.
+fn dispatch(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         None | Some("-h") | Some("--help") => {
             print!("{USAGE}");
@@ -361,8 +391,38 @@ mod tests {
         // Anything else is read as `discovered` and every verdict becomes `unknown`.
         let m = d["maturity"].as_str().unwrap();
         assert!(["discovered", "structured", "workflow-validated"].contains(&m), "{m}");
-        // `eq` is the schema's predicate; `equals` is dropped at runtime and the verdict is unknown.
-        assert_eq!(d["assertion"]["pass_when"]["eq"], "ok");
+        // Scan stitching is a transform: it makes no claim a verdict could be read from.
+        assert_eq!(d["assertion"]["not_applicable"], true);
+
+        // Rule: the command an MCP caller is handed is one this build answers. Called with no
+        // arguments a built command is a usage error (2); a refused one is exit 3.
+        let inv = &d["invocation"];
+        let template: Vec<&str> = inv["args_template"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+        assert!(COMMANDS.contains(&template[0]), "{}", template[0]);
+        assert_ne!(dispatch(&[template[0].to_string()]), ExitCode::from(3), "`{}` is refused", template[0]);
+        // The command takes no --json (an unknown option, exit 2), so none may be appended.
+        assert_eq!(inv["emits_json"], false);
+        // Rule: a `{token}` is a required input, and every optional is a declared input.
+        let props = d["inputs"]["properties"].as_object().unwrap();
+        let required: Vec<&str> = d["inputs"]["required"].as_array().expect("inputs name their required parameters").iter().map(|r| r.as_str().unwrap()).collect();
+        let tokens: Vec<&str> = template.iter().filter_map(|t| t.strip_prefix('{').and_then(|t| t.strip_suffix('}'))).collect();
+        assert!(!tokens.is_empty(), "the command needs its inputs");
+        for t in &tokens {
+            assert!(required.contains(t) && props.contains_key(*t), "{t}");
+        }
+        for r in &required {
+            assert!(tokens.contains(r), "required `{r}` is never passed");
+        }
+        for o in inv["optional"].as_array().into_iter().flatten() {
+            assert!(props.contains_key(o["arg"].as_str().unwrap()) && o["flag"].is_string(), "{o}");
+        }
+        // Rule: an artifact without `field`/`from_arg` is dropped by the registry without a word.
+        let artifacts = d["artifacts"].as_array().unwrap();
+        assert!(!artifacts.is_empty(), "the database written is the point of the call");
+        for a in artifacts {
+            assert!(a["role"].is_string() && a["from_arg"].as_str().is_some_and(|f| props.contains_key(f)), "{a}");
+        }
+        assert!(!d["consumes"].as_array().unwrap().is_empty());
     }
 
     #[test]
