@@ -1,6 +1,6 @@
 [package]
 name = "vyges-dft"
-version = "0.1.47"
+version = "0.1.48"
 edition = "2021"
 description = "Scan insertion and stitching, so a chip can be tested after fabrication."
 license = "Apache-2.0"
