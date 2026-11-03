@@ -170,9 +170,11 @@ pub fn stitch(
 fn stitch_chain(d: &mut dyn StitchDesign, config: &StitchConfig, cells: &[Cellp], ordinal: usize, trace: &mut Vec<String>) -> Result<StitchedChain, StitchError> {
     let refused = StitchError::Refused;
     let scan_enable_name = format_pattern(&config.enable_name_pattern, 0).map_err(refused)?;
-    let scan_enable = find_or_create_driver(d, "scan-enable", &scan_enable_name)?;
+    // 4155ac3 (da4340ad4e8): the scan enable is an ordinary high-fanout control, made SIGNAL;
+    // the scan in stays SCAN.
+    let scan_enable = find_or_create_driver(d, "scan-enable", &scan_enable_name, "SIGNAL")?;
     let scan_in_name = format_pattern(&config.in_name_pattern, ordinal).map_err(StitchError::Refused)?;
-    let scan_in = find_or_create_driver(d, "scan-in", &scan_in_name)?;
+    let scan_in = find_or_create_driver(d, "scan-in", &scan_in_name, "SCAN")?;
     for c in cells {
         connect(d, &c.name, &c.enable(), &scan_enable, false, trace)?;
     }
@@ -214,8 +216,9 @@ fn error(code: u32, msg: String) -> StitchError {
     StitchError::Error(format!("[ERROR DFT-{code:04}] {msg}"))
 }
 
-/// An `instance/terminal` that must be an output, else an existing port, else a new input port.
-pub fn find_or_create_driver(d: &mut dyn StitchDesign, kind: &str, with_name: &str) -> Result<Term, StitchError> {
+/// An `instance/terminal` that must be an output, else an existing port, else a new input port
+/// (it and its net of signal type `sig`).
+pub fn find_or_create_driver(d: &mut dyn StitchDesign, kind: &str, with_name: &str, sig: &str) -> Result<Term, StitchError> {
     let (inst, term) = split_term_identifier(with_name);
     if let Some(term) = term {
         if !d.inst_exists(&inst) {
@@ -234,7 +237,7 @@ pub fn find_or_create_driver(d: &mut dyn StitchDesign, kind: &str, with_name: &s
         // Its direction is not checked.
         return Ok(Term::Port(with_name.to_string()));
     }
-    create_new_port(d, with_name, "INPUT")
+    create_new_port(d, with_name, "INPUT", sig)
 }
 
 /// An `instance/terminal` that must be an input, else an existing port that must be an output,
@@ -267,20 +270,20 @@ pub fn find_or_create_scan_out(d: &mut dyn StitchDesign, cell_scan_out: &Term, w
             return Ok(Term::Port(port));
         }
     }
-    create_new_port(d, with_name, "OUTPUT")
+    create_new_port(d, with_name, "OUTPUT", "SCAN")
 }
 
-/// A new SCAN net and a SCAN port on it, of direction `io`.
-fn create_new_port(d: &mut dyn StitchDesign, name: &str, io: &str) -> Result<Term, StitchError> {
+/// A new net and a port on it, both of signal type `sig`, the port of direction `io`.
+fn create_new_port(d: &mut dyn StitchDesign, name: &str, io: &str, sig: &str) -> Result<Term, StitchError> {
     let refused = |e: String| StitchError::Refused(e);
     if !d.net_create(name).map_err(refused)? {
         return Err(error(31, format!("Error while attempting to create new port {name}: an unrelated net with the same name already exists")));
     }
-    d.net_set_sig_type(name, "SCAN").map_err(refused)?;
+    d.net_set_sig_type(name, sig).map_err(refused)?;
     if !d.bterm_create(name, name).map_err(refused)? {
         return Err(error(18, format!("Failed to create port: a port named '{name}' already exists")));
     }
-    d.bterm_set_sig_type(name, "SCAN").map_err(refused)?;
+    d.bterm_set_sig_type(name, sig).map_err(refused)?;
     d.bterm_set_io_type(name, io).map_err(refused)?;
     Ok(Term::Port(name.to_string()))
 }
@@ -461,10 +464,11 @@ mod tests {
         // Ports are made in order: enable, in, then out; the out net too.
         let made: Vec<&String> = d.ops.iter().filter(|o| o.starts_with("net ") || o.starts_with("port ")).collect();
         assert_eq!(made, vec!["net scan_enable_0", "port scan_enable_0", "net scan_in_0", "port scan_in_0", "net scan_out_0", "port scan_out_0"]);
-        // Both drivers are made before any cell is connected; drivers are inputs, the scan out an output.
+        // Both drivers are made before any cell is connected; drivers are inputs, the scan out an
+        // output. Rule (4155ac3, da4340ad4e8): the scan enable's port and net are SIGNAL.
         assert_eq!(
             d.ops[..9],
-            ["net scan_enable_0", "sig scan_enable_0 SCAN", "port scan_enable_0", "io scan_enable_0 INPUT", "net scan_in_0", "sig scan_in_0 SCAN", "port scan_in_0", "io scan_in_0 INPUT", "connect a/SCE scan_enable_0"]
+            ["net scan_enable_0", "sig scan_enable_0 SIGNAL", "port scan_enable_0", "io scan_enable_0 INPUT", "net scan_in_0", "sig scan_in_0 SCAN", "port scan_in_0", "io scan_in_0 INPUT", "connect a/SCE scan_enable_0"]
         );
         assert_eq!(d.ports["scan_out_0"], "OUTPUT");
     }
@@ -509,8 +513,8 @@ mod tests {
         assert_eq!(split_term_identifier("a\\/b/Q"), ("a\\/b".into(), Some("Q".into())));
         assert_eq!(split_term_identifier("p"), ("p".into(), None));
         let mut d = design(&names);
-        assert_eq!(find_or_create_driver(&mut d, "scan-in", "a/SCD"), Err(StitchError::Error("[ERROR DFT-0036] ITerm a/SCD for scan-in port is a INPUT".into())));
-        assert_eq!(find_or_create_driver(&mut d, "scan-in", "z/Q"), Err(StitchError::Error("[ERROR DFT-0034] Instance z not found for scan-in port".into())));
+        assert_eq!(find_or_create_driver(&mut d, "scan-in", "a/SCD", "SCAN"), Err(StitchError::Error("[ERROR DFT-0036] ITerm a/SCD for scan-in port is a INPUT".into())));
+        assert_eq!(find_or_create_driver(&mut d, "scan-in", "z/Q", "SCAN"), Err(StitchError::Error("[ERROR DFT-0034] Instance z not found for scan-in port".into())));
         let q = Term::Pin("a".into(), "Q".into());
         assert_eq!(find_or_create_scan_out(&mut d, &q, "a/Q"), Err(StitchError::Error("[ERROR DFT-0039] ITerm a/Q for scan-out port is a OUTPUT".into())));
         d.ports.insert("so".into(), "INPUT".into());

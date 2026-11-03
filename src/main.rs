@@ -19,8 +19,8 @@ const USAGE: &str = "\
 vyges physical dft — scan insertion and stitching, so a chip can be tested after fabrication
 
 USAGE:
-  vyges physical dft replace <design.odb> --liberty FILE... -o OUT.odb
-                                                  replace each flop by its closest scan equivalent
+  vyges physical dft replace <design.odb> --liberty FILE... -o OUT.odb [--dont-use CELL...]
+                                                  replace each flop by its best-matching scan cell
   vyges physical dft run     <design.odb> --liberty FILE... --sdc FILE -o OUT.odb [--max-length N]
                            [--max-chains N] [--clock-mixing no_mix|clock_mix] [--trace]
                                                   stitch the planned chains and record them
@@ -35,6 +35,8 @@ OPTIONS:
   -o FILE               write the report (or the output database) to FILE
   --liberty FILE        a Liberty library (repeatable, in read order; a cell resolves to the
                         first library that has it)
+  --dont-use CELL       a scan cell `replace` must not use (repeatable; `*` and `?` match as in
+                        a Tcl pattern)
   --json                machine-readable output instead of the text report
   -q, --quiet           suppress non-essential output
   -v, --verbose         extra detail on stderr
@@ -116,6 +118,7 @@ fn usage_error(msg: &str) -> ExitCode {
 /// its own order and replaces them. Log lines are the reference's.
 fn replace(args: &[String]) -> ExitCode {
     let (mut pos, mut out, mut liberty): (Vec<String>, _, Vec<String>) = (Vec::new(), None, Vec::new());
+    let mut dont_use: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -126,6 +129,10 @@ fn replace(args: &[String]) -> ExitCode {
             "--liberty" => match it.next() {
                 Some(f) => liberty.push(f.clone()),
                 None => return usage_error("--liberty needs a file"),
+            },
+            "--dont-use" => match it.next() {
+                Some(c) => dont_use.push(c.clone()),
+                None => return usage_error("--dont-use needs a cell name or pattern"),
             },
             "-q" | "--quiet" | "-v" | "--verbose" => {}
             f if f.starts_with('-') => return usage_error(&format!("unknown option `{f}`")),
@@ -149,7 +156,9 @@ fn replace(args: &[String]) -> ExitCode {
             Err(e) => return input_error(&format!("cannot read {f}: {e}")),
         }
     }
+    let origin = vyges_dft::replace::library_origins(&libs);
     let lib = vyges_dft::replace::merge_libraries(libs).unwrap_or_default();
+    let sel = vyges_dft::replace::Selection { dont_use: vyges_dft::replace::dont_use_cells(&lib, &dont_use), origin };
     let mut db = match vyges_opendb::Db::open(&design) {
         Ok(db) => db,
         Err(e) => return input_error(&format!("cannot read {design}: {e}")),
@@ -158,7 +167,7 @@ fn replace(args: &[String]) -> ExitCode {
         Ok(m) => m,
         Err(e) => return input_error(&format!("cannot list the masters of {design}: {e}")),
     };
-    let classes = match vyges_dft::replace::master_classes(&lib, &masters) {
+    let classes = match vyges_dft::replace::master_classes(&lib, &masters, &sel) {
         Ok(c) => c,
         Err(e) => {
             vyges_events::emit(&vyges_events::Event::new("vyges-dft", vyges_events::Severity::Error, format!("{e:?}; nothing written")).with_code("DFT-REFUSED"));

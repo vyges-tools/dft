@@ -11,7 +11,7 @@ A commercial chip has to be testable once it is made. Scan chains turn every fli
 ## Usage
 
 ```
-vyges physical dft replace <design.odb> --liberty FILE... -o OUT.odb
+vyges physical dft replace <design.odb> --liberty FILE... -o OUT.odb [--dont-use CELL...]
 vyges physical dft report  <design.odb> --liberty FILE... --sdc FILE [--max-length N] [--max-chains N]
                            [--clock-mixing no_mix|clock_mix]
 vyges physical dft run     <design.odb> --liberty FILE... --sdc FILE -o OUT.odb [--max-length N]
@@ -19,7 +19,9 @@ vyges physical dft run     <design.odb> --liberty FILE... --sdc FILE -o OUT.odb 
 vyges physical dft --describe
 ```
 
-- `replace`: each flip-flop replaced by its closest scan equivalent in the library.
+- `replace`: each flip-flop replaced by the scan cell that matches it best: the same cell footprint,
+  then the same library, then the closest output drive (within 1%), then the smallest area, then
+  the name. `--dont-use CELL` (repeatable, patterns allowed) keeps a scan cell out of the choice.
 - `report`: the scan chains as they would be built, by clock domain and edge, within the length and
   count limits.
 - `run`: the planned chains stitched (scan out to scan in, enables and ports added) and recorded in
