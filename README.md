@@ -1,7 +1,5 @@
 # vyges-dft
 
-**[Download Loom](https://vyges.com/products/vyges-cli/#install)** · install the free [Vyges CLI](https://vyges.com/products/vyges-cli/), then `vyges install physical`
-
 Scan insertion and stitching, so a chip can be tested after fabrication.
 
 > **Status: in development.** `replace`, `report` and `run` are built.
