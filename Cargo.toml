@@ -10,9 +10,14 @@ repository = "https://github.com/vyges-tools/dft"
 build = "build.rs"
 
 [features]
+default = ["mimalloc"]
 # The command-line entry built into the library too (`cli_main`), for the suite binaries
 # that link every engine and run the one they are invoked as.
 suite = []
+
+# The binary's allocator (see [dependencies]). On by default for the binary; the suite, the only
+# library consumer, links it too.
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
 [dependencies]
 serde_json = "1"
@@ -30,6 +35,19 @@ vyges-drt = { git = "https://github.com/vyges-tools/drt", branch = "main", defau
 # and the constraints: the clocks a scan cell's clock pin is reached by.
 vyges-grt = { git = "https://github.com/vyges-tools/grt.git", branch = "main", features = ["odb"] }
 vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "main" }
+
+# The binary's global allocator. The reference build links tcmalloc for all of its code
+# (BUILD.bazel `malloc = @tcmalloc`), not the system allocator; mimalloc measured fastest and
+# smallest of tcmalloc / jemalloc / mimalloc on a like-for-like trial. Pinned exactly:
+# libmimalloc-sys 0.1.44 bundles mimalloc v2 by default (0.1.45 on default to v3).
+mimalloc = { version = "=0.1.48", default-features = false, optional = true }
+libmimalloc-sys = { version = "=0.1.44", default-features = false, optional = true }
+
+# On Linux the allocator also REPLACES malloc/free process-wide (`override`), so C++ code linked
+# into the binary allocates through it too, as the reference's statically linked tcmalloc does for
+# all of its code. Not on macOS, where the system zone allocator is left alone.
+[target.'cfg(target_os = "linux")'.dependencies]
+libmimalloc-sys = { version = "=0.1.44", default-features = false, features = ["override"], optional = true }
 
 [[bin]]
 name = "vyges-dft"
@@ -63,3 +81,9 @@ vyges-loom = { path = "../vyges-tools-loom" }
 
 [patch."https://github.com/vyges-tools/layout"]
 vyges-layout = { path = "../vyges-tools-layout" }
+
+# The reference is built -O3 with link-time optimisation (Bazel --config=release). LTO and one
+# codegen unit let calls inline across crates; by language rule neither changes a result.
+[profile.release]
+lto = "fat"
+codegen-units = 1
