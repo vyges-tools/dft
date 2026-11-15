@@ -41,10 +41,10 @@ pub fn pin_clocks(libs: &[Library], netlist: &vyges_sta::netlist::Netlist, sdc: 
     s.find_arrivals()?;
     let mut at: HashMap<String, BTreeSet<usize>> = HashMap::new();
     // A pin's load vertex and its bidirect driver vertex share its name: both are read.
-    for (v, vertex) in g.vertices.iter().enumerate() {
-        for p in &s.paths[v] {
+    for (v, paths) in s.paths.iter().enumerate().take(g.vertices.len()) {
+        for p in paths {
             if let (true, Some(e)) = (p.tag.is_clock, p.tag.clk_edge) {
-                at.entry(vertex.name.clone()).or_default().insert(e / 2);
+                at.entry(g.vname(v)).or_default().insert(e / 2);
             }
         }
     }
